@@ -1,131 +1,195 @@
 import os
 import json
+import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import socket
+from socketserver import ThreadingMixIn
 import threading
+import socket
 
-# Environment configuration
-DEVICE_HOST = os.environ.get("AUBO_DEVICE_HOST", "127.0.0.1")
-DEVICE_PORT = int(os.environ.get("AUBO_DEVICE_PORT", "8899"))  # for JSON-RPC/TCP commands
-SERVER_HOST = os.environ.get("AUBO_DRIVER_HTTP_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("AUBO_DRIVER_HTTP_PORT", "8080"))
+# RTDE (Real-Time Data Exchange) CLIENT IMPLEMENTATION (Simplified for Demo)
+class RTDEClient:
+    def __init__(self, host, port, timeout=2):
+        self.host = host
+        self.port = int(port)
+        self.timeout = timeout
+        self.lock = threading.Lock()
 
-# Helper for JSON-RPC over TCP
-def send_json_rpc(method, params):
-    req = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params
-    }
-    msg = json.dumps(req).encode("utf-8")
-    msg_len = len(msg).to_bytes(4, byteorder='big')
-    response = b""
-    with socket.create_connection((DEVICE_HOST, DEVICE_PORT), timeout=3) as sock:
-        sock.sendall(msg_len + msg)
-        # Protocol: read 4 bytes for length, then that many bytes for payload
-        header = sock.recv(4)
-        if len(header) < 4:
-            raise RuntimeError("Invalid response from device")
-        resp_len = int.from_bytes(header, byteorder='big')
-        while len(response) < resp_len:
-            chunk = sock.recv(resp_len - len(response))
-            if not chunk:
-                break
-            response += chunk
-    return json.loads(response.decode("utf-8"))
+    def _send_jsonrpc(self, method, params=None):
+        request_id = 1
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params or {}
+        }
+        msg = (json.dumps(payload) + "\n").encode('utf-8')
+        with self.lock:
+            with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+                sock.sendall(msg)
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                txt = data.decode('utf-8').strip()
+                try:
+                    return json.loads(txt)
+                except Exception:
+                    return {"error": "Malformed response", "raw": txt}
 
-class AuboDriverHTTPRequestHandler(BaseHTTPRequestHandler):
-    def _set_json_response(self, code=200):
+    def get_status(self):
+        return self._send_jsonrpc("get_status")
+
+    def exec_script(self, script):
+        return self._send_jsonrpc("exec_script", {"script": script})
+
+    def set_speed(self, speed):
+        return self._send_jsonrpc("set_speed", {"speed": speed})
+
+    def start(self):
+        return self._send_jsonrpc("start")
+
+    def stop(self):
+        return self._send_jsonrpc("stop")
+
+    def reset(self):
+        return self._send_jsonrpc("reset")
+
+    def init(self):
+        return self._send_jsonrpc("init")
+
+    def set_mode(self, mode):
+        return self._send_jsonrpc("set_mode", {"mode": mode})
+
+    def set_io(self, io):
+        return self._send_jsonrpc("set_io", io)
+
+    def set_param(self, param):
+        return self._send_jsonrpc("set_param", param)
+
+# ENVIRONMENT VARIABLES
+ROBOT_HOST = os.environ.get("ROBOT_HOST", "127.0.0.1")
+ROBOT_RTDE_PORT = int(os.environ.get("ROBOT_RTDE_PORT", "8080"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+
+rtde = RTDEClient(ROBOT_HOST, ROBOT_RTDE_PORT)
+
+# HTTP SERVER IMPLEMENTATION
+class AuboRobotHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _set_headers(self, code=200, extra=None):
         self.send_response(code)
-        self.send_header('Content-type', 'application/json')
+        self.send_header('Content-Type', 'application/json')
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
         self.end_headers()
 
-    def _handle_json_rpc(self, rpc_method, required_keys=None):
-        content_len = int(self.headers.get('Content-Length', 0))
-        if content_len == 0:
-            self._set_json_response(400)
-            self.wfile.write(json.dumps({"error": "Empty body"}).encode())
-            return
+    def _parse_json(self):
+        clen = int(self.headers.get('Content-Length', 0))
+        if clen == 0:
+            return {}
         try:
-            data = json.loads(self.rfile.read(content_len))
+            return json.loads(self.rfile.read(clen))
         except Exception:
-            self._set_json_response(400)
-            self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
-            return
-
-        if required_keys:
-            missing = [k for k in required_keys if k not in data]
-            if missing:
-                self._set_json_response(400)
-                self.wfile.write(json.dumps({"error": f"Missing keys: {missing}"}).encode())
-                return
-
-        try:
-            resp = send_json_rpc(rpc_method, data)
-            self._set_json_response()
-            self.wfile.write(json.dumps(resp.get("result", resp)).encode())
-        except Exception as e:
-            self._set_json_response(500)
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-        if path == "/ik":
-            # Expected: { "pose": [x, y, z, rx, ry, rz] }
-            self._handle_json_rpc("compute_inverse_kinematics", required_keys=["pose"])
-        elif path == "/payload":
-            # Expected: { "weight": float, "center_of_mass": [x, y, z] }
-            self._handle_json_rpc("set_payload", required_keys=["weight", "center_of_mass"])
-        elif path == "/simul":
-            # Expected: { "enable": bool }
-            self._handle_json_rpc("set_simulation_mode", required_keys=["enable"])
-        elif path == "/io":
-            # Expected: { "type": "digital"/"analog", "channel": int, "value": int/float }
-            self._handle_json_rpc("set_io_output", required_keys=["type", "channel", "value"])
-        elif path == "/speed":
-            # Expected: { "speed": float }
-            self._handle_json_rpc("set_speed_slider", required_keys=["speed"])
-        elif path == "/power":
-            # Expected: { "on": bool }
-            self._handle_json_rpc("set_power_state", required_keys=["on"])
-        elif path == "/guide":
-            # Expected: { "enable": bool }
-            self._handle_json_rpc("set_handguide_mode", required_keys=["enable"])
-        else:
-            self._set_json_response(404)
-            self.wfile.write(json.dumps({"error": "Not found"}).encode())
+            return {}
 
     def do_GET(self):
-        # Optionally, a simple health check or metadata endpoint
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            info = {
-                "device": "AUBO Robot Arm",
-                "model": "AUBO series",
-                "manufacturer": "AUBO",
-                "api": [
-                    {"method": "POST", "path": "/ik", "desc": "Inverse kinematics"},
-                    {"method": "POST", "path": "/payload", "desc": "Set payload"},
-                    {"method": "POST", "path": "/simul", "desc": "Simulation mode"},
-                    {"method": "POST", "path": "/io", "desc": "IO control"},
-                    {"method": "POST", "path": "/speed", "desc": "Speed slider"},
-                    {"method": "POST", "path": "/power", "desc": "Power on/off"},
-                    {"method": "POST", "path": "/guide", "desc": "Handguide mode"},
-                ]
-            }
-            self.wfile.write(json.dumps(info).encode())
+        if self.path == "/status":
+            resp = rtde.get_status()
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"error": "Not Found"}).encode())
+
+    def do_POST(self):
+        if self.path == "/exec":
+            body = self._parse_json()
+            script = body.get("script", "")
+            if not script:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "Missing script"}).encode())
+                return
+            resp = rtde.exec_script(script)
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/speed":
+            body = self._parse_json()
+            speed = body.get("speed", None)
+            if speed is None:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "Missing speed"}).encode())
+                return
+            resp = rtde.set_speed(speed)
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/start":
+            resp = rtde.start()
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/stop":
+            resp = rtde.stop()
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/reset":
+            resp = rtde.reset()
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/init":
+            resp = rtde.init()
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/mode":
+            body = self._parse_json()
+            mode = body.get("mode", None)
+            if mode is None:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "Missing mode"}).encode())
+                return
+            resp = rtde.set_mode(mode)
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/io":
+            body = self._parse_json()
+            if not body:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "Missing IO data"}).encode())
+                return
+            resp = rtde.set_io(body)
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        elif self.path == "/param":
+            body = self._parse_json()
+            if not body:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "Missing param data"}).encode())
+                return
+            resp = rtde.set_param(body)
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode())
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"error": "Not Found"}).encode())
+
+    def log_message(self, format, *args):
+        return  # Silence default logging
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 def run_server():
-    server = HTTPServer((SERVER_HOST, SERVER_PORT), AuboDriverHTTPRequestHandler)
-    print(f"AUBO driver HTTP server running at http://{SERVER_HOST}:{SERVER_PORT}/")
-    server.serve_forever()
+    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), AuboRobotHandler)
+    print(f"AUBO Robot Arm HTTP Driver running at http://{SERVER_HOST}:{SERVER_PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_server()
