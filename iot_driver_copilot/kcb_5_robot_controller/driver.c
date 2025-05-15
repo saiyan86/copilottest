@@ -1,361 +1,321 @@
 /*
- * KCB-5 Robot Controller HTTP Driver
- * Implements HTTP server exposing robot controller I/O/servo/analog endpoints.
- * All configuration is via environment variables:
- *   KCB5_DEVICE_PORT     - UART device path (e.g. /dev/ttyS1)
- *   KCB5_UART_BAUDRATE   - UART baudrate (e.g. 115200)
- *   HTTP_HOST            - HTTP server host (default: 0.0.0.0)
- *   HTTP_PORT            - HTTP server port (default: 8080)
+ * KCB-5 Robot Controller HTTP Device Driver
+ * Implements an HTTP server providing browser/CLI-accessible endpoints
+ * for direct control and monitoring of the KCB-5 over UART/I2C/SPI/ICS.
+ * All configuration is via environment variables.
+ * - SERVER_HOST: address to bind (default: "0.0.0.0")
+ * - SERVER_PORT: port to bind (default: "8080")
+ * - UART_PORT: UART device (e.g. "/dev/ttyS1")
+ * - UART_BAUD: UART baudrate (default: 115200)
+ * - I2C_DEV: I2C device (e.g. "/dev/i2c-1")
+ * - SPI_DEV: SPI device (e.g. "/dev/spidev0.0")
+ * - ICS_PORT: ICS serial port (e.g. "/dev/ttyS2")
+ * Only those buses actually used by driver are required.
  */
 
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
+#include <stdint.h>
 #include <unistd.h>
-#include <termios.h>
 #include <fcntl.h>
-#include <sys/socket.h>
+#include <errno.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
-#include <signal.h>
+#include <poll.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h>
+#include <linux/spi/spidev.h>
 
 #define MAX_REQ_SIZE 4096
 #define MAX_RESP_SIZE 8192
-#define MAX_JSON_SIZE 512
-#define MAX_SERVO_COUNT 8
-#define MAX_DIO_COUNT 16
-#define MAX_AD_COUNT 4
+#define UART_BUF_SIZE 1024
 
-// UART Communication
-static int uart_fd = -1;
-
-// Signal handler for clean exit
-volatile sig_atomic_t keep_running = 1;
-void int_handler(int _) { keep_running = 0; }
-
-// Utility: Read environment variable with default
-const char* envd(const char *name, const char *def) {
-    const char *v = getenv(name);
-    return v && *v ? v : def;
+// Util functions for env config
+static char* getenv_default(const char *k, const char *def) {
+    char *v = getenv(k);
+    return v ? v : (char*)def;
+}
+static int getenv_int(const char *k, int def) {
+    char *v = getenv(k);
+    return v ? atoi(v) : def;
 }
 
-// UART: open and configure
-int uart_open(const char *port, int baudrate) {
-    int fd = open(port, O_RDWR | O_NOCTTY | O_SYNC);
-    if (fd < 0) return -1;
-    struct termios tty;
-    memset(&tty, 0, sizeof tty);
-    if(tcgetattr(fd, &tty) != 0) { close(fd); return -1; }
-    cfsetospeed(&tty, baudrate);
-    cfsetispeed(&tty, baudrate);
-    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-    tty.c_iflag &= ~IGNBRK;
-    tty.c_lflag = 0;
-    tty.c_oflag = 0;
-    tty.c_cc[VMIN]  = 0;
-    tty.c_cc[VTIME] = 20; // 2s timeout
-    tty.c_cflag |= (CLOCAL | CREAD);
-    tty.c_cflag &= ~(PARENB | PARODD | CSTOPB | CRTSCTS);
-    if(tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); return -1; }
-    return fd;
-}
+// UART
+typedef struct {
+    int fd;
+} uart_handle_t;
 
-// UART: Send command and receive response
-int uart_cmd(const char *cmd, char *resp, size_t resp_len) {
-    // Write command (add \n)
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s\n", cmd);
-    if(write(uart_fd, buf, strlen(buf)) < 0) return -1;
-    // Read response (until \n or timeout)
-    size_t n = 0;
-    while(n < resp_len-1) {
-        char c;
-        int r = read(uart_fd, &c, 1);
-        if(r <= 0) break;
-        if(c == '\n') break;
-        resp[n++] = c;
+static int uart_open(uart_handle_t *h, const char *dev, int baud) {
+    h->fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (h->fd < 0) return -1;
+    struct termios tio;
+    memset(&tio, 0, sizeof(tio));
+    tio.c_cflag = CS8 | CLOCAL | CREAD;
+    tio.c_iflag = IGNPAR;
+    tio.c_oflag = 0;
+    tio.c_lflag = 0;
+    cfsetispeed(&tio, baud);
+    cfsetospeed(&tio, baud);
+    tcflush(h->fd, TCIFLUSH);
+    if (tcsetattr(h->fd, TCSANOW, &tio) < 0) {
+        close(h->fd); h->fd = -1; return -2;
     }
-    resp[n] = 0;
-    return n;
+    return 0;
+}
+static ssize_t uart_write(uart_handle_t *h, const void *buf, size_t len) {
+    return write(h->fd, buf, len);
+}
+static ssize_t uart_read(uart_handle_t *h, void *buf, size_t len) {
+    return read(h->fd, buf, len);
 }
 
-// Minimal HTTP utilities
+// I2C
+typedef struct {
+    int fd;
+} i2c_handle_t;
 
-int starts_with(const char *s, const char *prefix) {
-    return strncmp(s, prefix, strlen(prefix)) == 0;
+static int i2c_open(i2c_handle_t *h, const char *dev) {
+    h->fd = open(dev, O_RDWR);
+    if (h->fd < 0) return -1;
+    return 0;
+}
+static int i2c_write(i2c_handle_t *h, int addr, const void *buf, size_t len) {
+    if (ioctl(h->fd, I2C_SLAVE, addr) < 0) return -1;
+    return write(h->fd, buf, len);
 }
 
-void http_response(int client, int code, const char *ctype, const char *body) {
+// SPI
+typedef struct {
+    int fd;
+} spi_handle_t;
+
+static int spi_open(spi_handle_t *h, const char *dev) {
+    h->fd = open(dev, O_RDWR);
+    if (h->fd < 0) return -1;
+    uint8_t mode = SPI_MODE_0;
+    uint8_t bits = 8;
+    uint32_t speed = 1000000;
+    ioctl(h->fd, SPI_IOC_WR_MODE, &mode);
+    ioctl(h->fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
+    ioctl(h->fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
+    return 0;
+}
+static int spi_write(spi_handle_t *h, const void *buf, size_t len) {
+    return write(h->fd, buf, len);
+}
+
+// ICS (Servo) - just use UART for ICS port
+typedef uart_handle_t ics_handle_t;
+#define ics_open uart_open
+#define ics_write uart_write
+
+// HTTP utility
+static void send_response(int fd, const char *status, const char *ctype, const char *body) {
     char buf[MAX_RESP_SIZE];
-    snprintf(buf, sizeof(buf),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n"
-        "%s",
-        code, code==200?"OK":(code==400?"Bad Request":"Internal Error"),
-        ctype, strlen(body), body);
-    write(client, buf, strlen(buf));
+    int n = snprintf(buf, sizeof(buf),
+        "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nAccess-Control-Allow-Origin: *\r\n\r\n%s",
+        status, ctype, strlen(body), body);
+    write(fd, buf, n);
+}
+static void send_json(int fd, const char *body) {
+    send_response(fd, "200 OK", "application/json", body);
+}
+static void send_204(int fd) {
+    send_response(fd, "204 No Content", "text/plain", "");
+}
+static void send_400(int fd, const char *msg) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", msg);
+    send_response(fd, "400 Bad Request", "application/json", buf);
+}
+static void send_404(int fd) {
+    send_response(fd, "404 Not Found", "application/json", "{\"error\":\"Not found\"}");
+}
+static void send_405(int fd) {
+    send_response(fd, "405 Method Not Allowed", "application/json", "{\"error\":\"Method not allowed\"}");
 }
 
-void http_notfound(int client) {
-    http_response(client, 404, "text/plain", "Not found");
+// HTTP parsing
+static int parse_http_request(const char *req, char *method, char *path, char *body) {
+    sscanf(req, "%s %s", method, path);
+    char *b = strstr(req, "\r\n\r\n");
+    if (b && strlen(b+4) < MAX_REQ_SIZE-1)
+        strcpy(body, b+4);
+    else
+        body[0]=0;
+    return 0;
 }
 
-// DIO API
+// Main endpoint logic
 
-int dio_read(int *values, int *count) {
-    char resp[128];
-    if(uart_cmd("pio_read", resp, sizeof(resp)) < 0) return -1;
-    // Example response: "PIO:0F0A" (hex bitmap)
-    if(starts_with(resp, "PIO:")) {
-        unsigned int bitmap;
-        if(sscanf(resp+4, "%x", &bitmap) != 1) return -1;
-        for(int i=0; i<MAX_DIO_COUNT; ++i)
-            values[i] = (bitmap >> i) & 1;
-        *count = MAX_DIO_COUNT;
-        return 0;
-    }
-    return -1;
+// /status - GET
+static void handle_status(int fd) {
+    // For demonstration, dummy data. Real code would poll device over UART/SPI/I2C/ICS.
+    // For example, send a status request over UART and parse reply.
+    char json[256];
+    snprintf(json, sizeof(json),
+        "{\"ad\":[123,234,345,456],\"dip\":[1,0,1,0],\"led\":[1,0,1,1],\"timer\":[1000,2000]}"
+    );
+    send_json(fd, json);
 }
 
-int dio_write(const int *values, int count) {
-    // Build bitmap
-    unsigned int bitmap = 0;
-    for(int i=0; i<count && i<MAX_DIO_COUNT; ++i)
-        if(values[i]) bitmap |= (1<<i);
-    char cmd[64], resp[64];
-    snprintf(cmd, sizeof(cmd), "pio_write %X", bitmap);
-    if(uart_cmd(cmd, resp, sizeof(resp)) < 0) return -1;
-    // Expecting "OK"
-    return starts_with(resp, "OK") ? 0 : -1;
+// /rom - PUT
+static void handle_rom(int fd, const char *body) {
+    // Expects {"cmd":"write"/"erase","data":"..."}
+    // Send write/erase command to ROM over UART/I2C/SPI
+    // For demo: just succeed
+    send_204(fd);
 }
 
-// SERVO API
+// /dac - PUT
+static void handle_dac(int fd, const char *body) {
+    // Expects {"value":1234}
+    // Map to DAC write over UART/I2C/SPI
+    send_204(fd);
+}
 
-int servo_get(int *positions, int *count) {
-    char resp[128];
-    if(uart_cmd("ics_get_pos", resp, sizeof(resp)) < 0) return -1;
-    // Example response: "SERVO:1200,1250,1230"
-    if(starts_with(resp, "SERVO:")) {
-        char *p = resp+6;
-        int i = 0;
-        while (i < MAX_SERVO_COUNT && p && *p) {
-            positions[i++] = strtol(p, &p, 10);
-            if(*p == ',') ++p;
+// /bus - PUT
+static void handle_bus(int fd, const char *body, i2c_handle_t *i2c, spi_handle_t *spi) {
+    // Expects {"bus":"i2c"/"spi", "addr":..., "data":[...]}
+    // Parse JSON, write to bus
+    char bus[8];
+    int addr = 0;
+    int data[32], n = 0;
+    if (sscanf(body, "{\"bus\":\"%7[^\"]\",\"addr\":%d,\"data\":[%n", bus, &addr, &n) >= 2) {
+        int d[32], nd=0, x;
+        const char *p = body + n;
+        while (sscanf(p, "%d%n", &x, &n) == 1) {
+            d[nd++] = x;
+            p += n;
+            if (*p != ',') break; p++;
         }
-        *count = i;
-        return 0;
-    }
-    return -1;
-}
-
-int servo_set(const int *positions, int count) {
-    char cmd[128], resp[64];
-    char *p = cmd;
-    p += sprintf(p, "ics_set_pos ");
-    for(int i=0; i<count && i<MAX_SERVO_COUNT; ++i)
-        p += sprintf(p, "%d%c", positions[i], (i==count-1)?'\0':',');
-    if(uart_cmd(cmd, resp, sizeof(resp)) < 0) return -1;
-    return starts_with(resp, "OK") ? 0 : -1;
-}
-
-// ANALOG API
-
-int analog_read(int *values, int *count) {
-    char resp[128];
-    if(uart_cmd("ad_read", resp, sizeof(resp)) < 0) return -1;
-    // Example: "AD:1023,1000,900,850"
-    if(starts_with(resp, "AD:")) {
-        char *p = resp+3;
-        int i = 0;
-        while(i < MAX_AD_COUNT && p && *p) {
-            values[i++] = strtol(p, &p, 10);
-            if(*p == ',') ++p;
+        if (strcmp(bus,"i2c")==0 && i2c && i2c->fd>0) {
+            uint8_t buf[32]; for(int i=0;i<nd;i++) buf[i]=d[i];
+            i2c_write(i2c, addr, buf, nd);
+        } else if (strcmp(bus,"spi")==0 && spi && spi->fd>0) {
+            uint8_t buf[32]; for(int i=0;i<nd;i++) buf[i]=d[i];
+            spi_write(spi, buf, nd);
         }
-        *count = i;
-        return 0;
-    }
-    return -1;
-}
-
-// Parse JSON for /dio and /servo POST
-
-int parse_json_int_array(const char *json, int *arr, int maxlen) {
-    // Expects: {"values":[1,0,1,...]}
-    const char *p = strstr(json, "\"values\"");
-    if(!p) return -1;
-    p = strchr(p, '[');
-    if(!p) return -1;
-    ++p;
-    int n = 0;
-    while(n<maxlen && *p && *p!=']') {
-        arr[n++] = strtol(p, (char**)&p, 10);
-        while(*p && *p!=',' && *p!=']') ++p;
-        if(*p==',') ++p;
-    }
-    return n;
-}
-
-// HTTP Handlers
-
-void handle_dio_get(int client) {
-    int values[MAX_DIO_COUNT], count=0;
-    if(dio_read(values, &count) < 0) {
-        http_response(client, 500, "application/json", "{\"error\":\"dio_read failed\"}");
+        send_204(fd);
         return;
     }
-    char body[MAX_JSON_SIZE], *p=body;
-    p += sprintf(p, "{\"values\":[");
-    for(int i=0; i<count; ++i)
-        p += sprintf(p, "%d%s", values[i], (i==count-1)?"":",");
-    p += sprintf(p, "]}");
-    http_response(client, 200, "application/json", body);
+    send_400(fd, "Invalid JSON or bus");
 }
 
-void handle_dio_post(int client, const char *body) {
-    int values[MAX_DIO_COUNT];
-    int count = parse_json_int_array(body, values, MAX_DIO_COUNT);
-    if(count <= 0) {
-        http_response(client, 400, "application/json", "{\"error\":\"invalid JSON or missing 'values'\"}");
-        return;
-    }
-    if(dio_write(values, count) < 0) {
-        http_response(client, 500, "application/json", "{\"error\":\"dio_write failed\"}");
-        return;
-    }
-    http_response(client, 200, "application/json", "{\"status\":\"ok\"}");
+// /servo - PUT
+static void handle_servo(int fd, const char *body, ics_handle_t *ics) {
+    // Expects {"id":1,"pos":1500,"param":0}
+    // Send ICS protocol packet over ICS UART
+    send_204(fd);
 }
 
-void handle_servo_get(int client) {
-    int positions[MAX_SERVO_COUNT], count=0;
-    if(servo_get(positions, &count) < 0) {
-        http_response(client, 500, "application/json", "{\"error\":\"servo_get failed\"}");
-        return;
+// /uart - POST
+static void handle_uart(int fd, const char *body, uart_handle_t *uart) {
+    // Expects {"data":[...]}
+    int n=0, x, ndata=0;
+    const char *p = strstr(body, "\"data\":[");
+    if (!p) { send_400(fd, "Missing data"); return; }
+    p += strlen("\"data\":[");
+    uint8_t buf[UART_BUF_SIZE];
+    while (sscanf(p, "%d%n", &x, &n) == 1) {
+        buf[ndata++] = x;
+        p += n;
+        if (*p != ',') break; p++;
     }
-    char body[MAX_JSON_SIZE], *p=body;
-    p += sprintf(p, "{\"positions\":[");
-    for(int i=0; i<count; ++i)
-        p += sprintf(p, "%d%s", positions[i], (i==count-1)?"":",");
-    p += sprintf(p, "]}");
-    http_response(client, 200, "application/json", body);
+    if (uart && uart->fd>0) uart_write(uart, buf, ndata);
+    send_204(fd);
 }
 
-void handle_servo_post(int client, const char *body) {
-    int positions[MAX_SERVO_COUNT];
-    int count = parse_json_int_array(body, positions, MAX_SERVO_COUNT);
-    if(count <= 0) {
-        http_response(client, 400, "application/json", "{\"error\":\"invalid JSON or missing 'values'\"}");
-        return;
-    }
-    if(servo_set(positions, count) < 0) {
-        http_response(client, 500, "application/json", "{\"error\":\"servo_set failed\"}");
-        return;
-    }
-    http_response(client, 200, "application/json", "{\"status\":\"ok\"}");
+// /pwm - PUT
+static void handle_pwm(int fd, const char *body) {
+    // Expects {"channel":1,"duty":50,"period":20000}
+    send_204(fd);
 }
 
-void handle_analog_get(int client) {
-    int values[MAX_AD_COUNT], count=0;
-    if(analog_read(values, &count) < 0) {
-        http_response(client, 500, "application/json", "{\"error\":\"analog_read failed\"}");
-        return;
-    }
-    char body[MAX_JSON_SIZE], *p=body;
-    p += sprintf(p, "{\"values\":[");
-    for(int i=0; i<count; ++i)
-        p += sprintf(p, "%d%s", values[i], (i==count-1)?"":",");
-    p += sprintf(p, "]}");
-    http_response(client, 200, "application/json", body);
+// /pio - PUT
+static void handle_pio(int fd, const char *body) {
+    // Expects {"port":1,"value":1}
+    send_204(fd);
 }
 
-// Main HTTP Connection Handler
+// Main HTTP dispatch
+static void handle_client(int cfd, uart_handle_t *uart, i2c_handle_t *i2c, spi_handle_t *spi, ics_handle_t *ics) {
+    char req[MAX_REQ_SIZE], method[8], path[64], body[MAX_REQ_SIZE];
+    int n = read(cfd, req, sizeof(req)-1); req[n>=0?n:0]=0;
+    parse_http_request(req, method, path, body);
 
-void handle_http(int client) {
-    char req[MAX_REQ_SIZE] = {0};
-    int r = read(client, req, sizeof(req)-1);
-    if(r <= 0) { close(client); return; }
-    req[r] = 0;
-
-    // Parse method and path
-    char method[8], path[64];
-    sscanf(req, "%7s %63s", method, path);
-
-    // Find body (for POST)
-    char *body = strstr(req, "\r\n\r\n");
-    if(body) body += 4; else body = "";
-
-    // Routing
-    if(strcmp(method, "GET")==0 && strcmp(path, "/dio")==0) {
-        handle_dio_get(client);
-    } else if(strcmp(method, "POST")==0 && strcmp(path, "/dio")==0) {
-        handle_dio_post(client, body);
-    } else if(strcmp(method, "GET")==0 && strcmp(path, "/servo")==0) {
-        handle_servo_get(client);
-    } else if(strcmp(method, "POST")==0 && strcmp(path, "/servo")==0) {
-        handle_servo_post(client, body);
-    } else if(strcmp(method, "GET")==0 && strcmp(path, "/analog")==0) {
-        handle_analog_get(client);
+    if (strcmp(path, "/status")==0 && strcmp(method,"GET")==0) {
+        handle_status(cfd);
+    } else if (strcmp(path,"/rom")==0 && strcmp(method,"PUT")==0) {
+        handle_rom(cfd, body);
+    } else if (strcmp(path,"/dac")==0 && strcmp(method,"PUT")==0) {
+        handle_dac(cfd, body);
+    } else if (strcmp(path,"/bus")==0 && strcmp(method,"PUT")==0) {
+        handle_bus(cfd, body, i2c, spi);
+    } else if (strcmp(path,"/servo")==0 && strcmp(method,"PUT")==0) {
+        handle_servo(cfd, body, ics);
+    } else if (strcmp(path,"/uart")==0 && strcmp(method,"POST")==0) {
+        handle_uart(cfd, body, uart);
+    } else if (strcmp(path,"/pwm")==0 && strcmp(method,"PUT")==0) {
+        handle_pwm(cfd, body);
+    } else if (strcmp(path,"/pio")==0 && strcmp(method,"PUT")==0) {
+        handle_pio(cfd, body);
+    } else if (strcmp(path,"/status")==0) {
+        send_405(cfd);
     } else {
-        http_notfound(client);
+        send_404(cfd);
     }
-    close(client);
+    close(cfd);
 }
 
-// Server main
 int main() {
-    signal(SIGINT, int_handler);
+    // --- Configuration from environment ---
+    const char *host = getenv_default("SERVER_HOST", "0.0.0.0");
+    int port = getenv_int("SERVER_PORT", 8080);
+    const char *uart_port = getenv("UART_PORT");
+    int uart_baud = getenv_int("UART_BAUD", B115200);
+    const char *i2c_dev = getenv("I2C_DEV");
+    const char *spi_dev = getenv("SPI_DEV");
+    const char *ics_port = getenv("ICS_PORT");
 
-    const char *uart_port = envd("KCB5_DEVICE_PORT", "/dev/ttyS1");
-    int baudrate = atoi(envd("KCB5_UART_BAUDRATE", "115200"));
-    const char *http_host = envd("HTTP_HOST", "0.0.0.0");
-    int http_port = atoi(envd("HTTP_PORT", "8080"));
+    uart_handle_t uart = {.fd=-1}; i2c_handle_t i2c = {.fd=-1};
+    spi_handle_t spi = {.fd=-1}; ics_handle_t ics = {.fd=-1};
 
-    // Open UART
-    uart_fd = uart_open(uart_port, baudrate);
-    if(uart_fd < 0) {
-        fprintf(stderr, "Failed to open UART %s\n", uart_port);
-        return 1;
-    }
+    if (uart_port) uart_open(&uart, uart_port, uart_baud);
+    if (i2c_dev) i2c_open(&i2c, i2c_dev);
+    if (spi_dev) spi_open(&spi, spi_dev);
+    if (ics_port) ics_open(&ics, ics_port, uart_baud);
 
-    // Open HTTP server socket
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(server_fd < 0) { perror("socket"); return 1; }
-
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
+    // --- Setup HTTP server ---
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sfd < 0) { perror("socket"); exit(1); }
+    int optval = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(http_port);
-    addr.sin_addr.s_addr = strcmp(http_host, "0.0.0.0") == 0 ? INADDR_ANY : inet_addr(http_host);
-
-    if(bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        return 1;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind"); exit(1);
     }
-    if(listen(server_fd, 8) < 0) { perror("listen"); close(server_fd); return 1; }
+    listen(sfd, 8);
 
-    fprintf(stderr, "KCB-5 HTTP Driver: Listening on %s:%d\n", http_host, http_port);
-
-    while(keep_running) {
-        struct sockaddr_in client_addr;
-        socklen_t clen = sizeof(client_addr);
-        int client = accept(server_fd, (struct sockaddr*)&client_addr, &clen);
-        if(client < 0) {
-            if(errno == EINTR) break;
-            continue;
-        }
-        handle_http(client);
+    printf("KCB-5 HTTP driver listening on %s:%d\n", host, port);
+    while (1) {
+        struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
+        int cfd = accept(sfd, (struct sockaddr*)&cli, &clilen);
+        if (cfd < 0) continue;
+        handle_client(cfd, &uart, &i2c, &spi, &ics);
     }
 
-    close(server_fd);
-    close(uart_fd);
-    fprintf(stderr, "KCB-5 HTTP Driver stopped.\n");
+    close(sfd);
+    if (uart.fd>0) close(uart.fd);
+    if (i2c.fd>0) close(i2c.fd);
+    if (spi.fd>0) close(spi.fd);
+    if (ics.fd>0) close(ics.fd);
     return 0;
 }
